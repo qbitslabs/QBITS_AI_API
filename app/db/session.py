@@ -18,6 +18,7 @@ engine = create_async_engine(
     connect_args={
         "ssl": "require",
         "server_settings": {"search_path": "public"},
+        "statement_cache_size": 0,
     },
 )
 
