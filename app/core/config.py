@@ -22,9 +22,23 @@ class Settings(BaseSettings):
         if "sqlite" in url.lower():
             raise RuntimeError("SQLite is not supported. Use postgresql+asyncpg:// for the AI service.")
         if url.startswith("postgresql://"):
-            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        if url.startswith("postgres://"):
-            return url.replace("postgres://", "postgresql+asyncpg://", 1)
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+
+        try:
+            from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
+            parsed = urlsplit(url)
+            # Filter out parameters that asyncpg doesn't accept as keyword arguments
+            allowed_params = [
+                (k, v)
+                for k, v in parse_qsl(parsed.query)
+                if k.lower() not in {"pgbouncer", "sslmode", "pool_timeout", "connection_limit"}
+            ]
+            url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(allowed_params), parsed.fragment))
+        except Exception:
+            pass
+
         return url
 
     # OpenRouter Integration
@@ -32,7 +46,7 @@ class Settings(BaseSettings):
     OPENROUTER_FALLBACK_API_KEY: Optional[str] = None
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     DEFAULT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    FALLBACK_MODEL: str = "deepseek/deepseek-v4-flash-0731"
+    FALLBACK_MODEL: str = "deepseek/deepseek-v4-flash-0731:free"
     FALLBACK_MODEL_2: Optional[str] = "google/gemma-4-26b-a4b-it:free"
 
     # CGS Backend Internal Service Integration
