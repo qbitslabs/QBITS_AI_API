@@ -44,10 +44,10 @@ class Settings(BaseSettings):
     # OpenRouter Integration
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_FALLBACK_API_KEY: Optional[str] = None
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    DEFAULT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    FALLBACK_MODEL: str = "deepseek/deepseek-v4-flash-0731:free"
-    FALLBACK_MODEL_2: Optional[str] = "google/gemma-4-26b-a4b-it:free"
+    OPENROUTER_BASE_URL: str = "https://api.groq.com/openai/v1"
+    DEFAULT_MODEL: str = "openai/gpt-oss-120b"
+    FALLBACK_MODEL: str = "meta-llama/llama-prompt-guard-2-86m"
+    FALLBACK_MODEL_2: Optional[str] = "qwen/qwen3.8-27b"
 
     # CGS Backend Internal Service Integration
     CGS_INTERNAL_URL: str = "http://localhost:4000"
