@@ -75,17 +75,21 @@ async def correlation_id_middleware(request: Request, call_next):
     return response
 
 
-# Health check endpoint confirming API and OpenRouter readiness.
+# Health check endpoint confirming API and LLM provider readiness.
 @app.get("/health", tags=["Health"])
 async def health_check():
+    provider = "groq" if "groq.com" in settings.llm_base_url else "openrouter"
     return {
         "status": "ok",
         "service": "cgs-ai-service",
         "environment": settings.APP_ENV,
+        "provider": provider,
+        "base_url": settings.llm_base_url,
         "default_model": settings.DEFAULT_MODEL,
         "fallback_model": settings.FALLBACK_MODEL,
         "fallback_model_2": settings.FALLBACK_MODEL_2,
-        "openrouter_configured": bool(settings.OPENROUTER_API_KEY),
+        "llm_configured": bool(settings.api_key),
+        "openrouter_configured": bool(settings.api_key),
     }
 
 

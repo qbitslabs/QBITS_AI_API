@@ -31,9 +31,9 @@ class OpenRouterProvider(BaseLLMProvider):
         default_model: Optional[str] = None,
         fallback_model: Optional[str] = None,
     ):
-        self.api_key = api_key or settings.OPENROUTER_API_KEY
-        self.fallback_api_key = (settings.OPENROUTER_FALLBACK_API_KEY or "").strip() or self.api_key
-        self.base_url = (base_url or settings.OPENROUTER_BASE_URL).rstrip("/")
+        self.api_key = api_key or settings.api_key
+        self.fallback_api_key = (settings.fallback_api_key or "").strip() or self.api_key
+        self.base_url = (base_url or settings.llm_base_url).rstrip("/")
         self.default_model = default_model or settings.DEFAULT_MODEL
         self.fallback_model = fallback_model or settings.FALLBACK_MODEL
         self.fallback_model_2 = (settings.FALLBACK_MODEL_2 or "").strip() or None
@@ -43,12 +43,21 @@ class OpenRouterProvider(BaseLLMProvider):
 
     # Headers.
     def _headers(self, api_key: Optional[str] = None) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {api_key or self.api_key}",
-            "HTTP-Referer": "https://clinicgrowth.com",
-            "X-Title": "Clinic Growth System AI Engine",
+        key = (api_key or self.api_key or "").strip()
+        if not key:
+            provider = "Groq" if "groq.com" in self.base_url else "OpenRouter"
+            env_var = "GROQ_API_KEY" if provider == "Groq" else "OPENROUTER_API_KEY"
+            raise RuntimeError(
+                f"Missing API key for {provider}. Please set {env_var} in your Render/environment settings."
+            )
+        headers: Dict[str, str] = {
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
+        if "openrouter.ai" in self.base_url:
+            headers["HTTP-Referer"] = "https://clinicgrowth.com"
+            headers["X-Title"] = "Clinic Growth System AI Engine"
+        return headers
 
     # Make request.
     async def _make_request(
@@ -76,7 +85,8 @@ class OpenRouterProvider(BaseLLMProvider):
 
         if response.status_code != 200:
             error_body = response.text
-            raise RuntimeError(f"OpenRouter API Error [{response.status_code}]: {error_body}")
+            provider = "Groq" if "groq.com" in self.base_url else "OpenRouter"
+            raise RuntimeError(f"{provider} API Error [{response.status_code}]: {error_body}")
 
         data = response.json()
         choice = data.get("choices", [{}])[0]
@@ -87,8 +97,11 @@ class OpenRouterProvider(BaseLLMProvider):
         completion_tokens = usage.get("completion_tokens", 0)
         total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
 
-        # Google: Gemma 4 31B on OpenRouter (~$0.08/1M input, $0.35/1M output)
-        estimated_cost = (prompt_tokens * 0.00000008) + (completion_tokens * 0.00000035)
+        # Estimated cost (Groq Llama 3.3 70B: ~$0.59/1M in, $0.79/1M out; fallback free/minimal)
+        if "groq.com" in self.base_url:
+            estimated_cost = (prompt_tokens * 0.00000059) + (completion_tokens * 0.00000079)
+        else:
+            estimated_cost = (prompt_tokens * 0.00000008) + (completion_tokens * 0.00000035)
 
         tool_calls = message.get("tool_calls", []) or []
 
@@ -103,7 +116,7 @@ class OpenRouterProvider(BaseLLMProvider):
             finish_reason=choice.get("finish_reason"),
         )
 
-    # Retry once on 402 with a lower max_tokens if OpenRouter says we can only afford N.
+    # Retry once on 402 with a lower max_tokens if provider says we can only afford N.
     async def _generate_with_retries(
         self,
         client: httpx.AsyncClient,
@@ -121,7 +134,7 @@ class OpenRouterProvider(BaseLLMProvider):
             current = int(payload.get("max_tokens") or 400)
             if affordable and affordable < current:
                 logger.warning(
-                    f"OpenRouter credits low — retrying {model_name} with max_tokens={affordable} (was {current})"
+                    f"LLM credits low — retrying {model_name} with max_tokens={affordable} (was {current})"
                 )
                 retry_payload = {**payload, "max_tokens": affordable}
                 return await self._make_request(client, retry_payload, model_name, api_key=api_key)
@@ -172,6 +185,8 @@ class OpenRouterProvider(BaseLLMProvider):
 
         last_err: Optional[Exception] = None
         skip_free = False
+        provider = "Groq" if "groq.com" in self.base_url else "OpenRouter"
+
         for model_name in attempt_order:
             if skip_free and ":free" in (model_name or ""):
                 logger.info(f"Skipping free model [{model_name}] — daily quota already hit")
@@ -183,9 +198,9 @@ class OpenRouterProvider(BaseLLMProvider):
             key = self.fallback_api_key if is_fallback else self.api_key
 
             if last_err is None:
-                logger.info(f"Dispatching LLM generation to OpenRouter model: {model_name}")
+                logger.info(f"Dispatching LLM generation to {provider} model: {model_name}")
             else:
-                logger.warning(f"Retrying on [{model_name}] after failure: {last_err}")
+                logger.warning(f"Retrying on {provider} [{model_name}] after failure: {last_err}")
 
             self._in_flight.add(model_name)
             try:
@@ -196,6 +211,11 @@ class OpenRouterProvider(BaseLLMProvider):
                 err_text = str(err).strip() or type(err).__name__
                 logger.error(f"Model [{model_name}] failed: {err_text}")
                 last_err = RuntimeError(err_text) if not str(err).strip() else err
+
+                # Groq / OpenRouter rate limit handling
+                if "[429]" in err_text or "rate_limit_exceeded" in err_text:
+                    logger.warning(f"Model [{model_name}] hit rate limit on {provider} — failing over to next model")
+
                 # Account-wide free daily quota — other :free models share the same bucket.
                 # Skip remaining free models; continue to paid/BYOK if present in the chain.
                 if "[404]" in err_text and "unavailable for free" in err_text.lower():
@@ -215,4 +235,8 @@ class OpenRouterProvider(BaseLLMProvider):
             finally:
                 self._in_flight.discard(model_name)
 
-        raise last_err or RuntimeError("No OpenRouter model available")
+        raise last_err or RuntimeError(f"No {provider} model available")
+
+
+# Alias for readability when importing
+GroqProvider = OpenRouterProvider

@@ -1413,7 +1413,7 @@ class AIOrchestrator:
                 "entityType": request.entity_type.upper(),
                 "entityId": request.entity_id,
                 "operationType": "CONVERSATION_RESPONSE",
-                "provider": "openrouter",
+                "provider": "groq" if "groq.com" in getattr(self.provider, "base_url", "") else "openrouter",
                 "model": used_model,
                 "inputTokens": total_prompt_tokens,
                 "outputTokens": total_completion_tokens,
