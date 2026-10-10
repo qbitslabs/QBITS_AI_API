@@ -105,7 +105,7 @@ class Settings(BaseSettings):
 
     # CGS Backend Internal Service Integration
     CGS_INTERNAL_URL: str = "https://qbits-ai-api.onrender.com"
-    CGS_INTERNAL_SERVICE_KEY: str = "cgs-internal-service-secret-key-998877"
+    CGS_INTERNAL_SERVICE_KEY: str = ""
     CORS_ORIGINS: str = "https://cgs-wa-api.onrender.com,https://cgs-backend-zcic.onrender.com,https://cgs-admin-frontend-pearl.vercel.app,https://cgs-frontend-mu.vercel.app/"
 
     # HTTP & LLM Parameters

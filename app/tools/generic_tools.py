@@ -16,60 +16,6 @@ def _entity_config(entity: Dict[str, Any]) -> Dict[str, Any]:
     return nested if isinstance(nested, dict) else {}
 
 
-# Entity info tool.
-class EntityInfoTool(BaseTool):
-    name = "get_entity_info"
-    description = "Retrieve details, operating hours, policies, and background information about the current business entity."
-    parameters = {
-        "type": "object",
-        "properties": {},
-        "required": [],
-    }
-    capability = "generic"
-
-    # Execute.
-    async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Any:
-        entity = context.get("entity", {}) or {}
-        return {
-            "name": entity.get("name"),
-            "type": entity.get("type"),
-            "configuration": _entity_config(entity),
-        }
-
-
-# Knowledge base search tool.
-class KnowledgeBaseSearchTool(BaseTool):
-    name = "knowledge_base_search"
-    description = "Search the entity's knowledge base or FAQ documentation for relevant answers."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search keyword or question to search the knowledge base for."}
-        },
-        "required": ["query"],
-    }
-    capability = "generic"
-
-    # Execute.
-    async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Any:
-        query = (arguments.get("query") or "").lower()
-        entity = context.get("entity", {}) or {}
-        kb = _entity_config(entity).get("knowledge_base", [])
-        if not isinstance(kb, list):
-            kb = []
-
-        matched = [
-            item for item in kb
-            if isinstance(item, dict) and (
-                query in (item.get("question") or "").lower()
-                or query in (item.get("answer") or "").lower()
-            )
-        ]
-        if not matched:
-            return {"results": kb[:3], "message": "Showing general knowledge base entries."}
-        return {"results": matched}
-
-
 # Faq lookup tool.
 class FaqLookupTool(BaseTool):
     name = "faq_lookup"

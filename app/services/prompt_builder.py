@@ -6,6 +6,13 @@ from app.entities.base import EntityContext
 from app.memory.memory_engine import MemoryContext
 
 
+def _clip(text: str, limit: int) -> str:
+    body = (text or "").strip()
+    if len(body) <= limit:
+        return body
+    return body[:limit].rstrip() + "…"
+
+
 # Prompt builder.
 class PromptBuilder:
     # Build prompt messages.
@@ -43,14 +50,14 @@ class PromptBuilder:
         if meta.get("howHeardAboutDoctor"):
             lead_bits.append(f"How they found us: {meta.get('howHeardAboutDoctor')}")
         if meta.get("landingContext") or meta.get("leadNotes"):
-            lead_bits.append(f"Notes:\n{meta.get('landingContext') or meta.get('leadNotes')}")
+            lead_bits.append(
+                "Notes: " + _clip(str(meta.get("landingContext") or meta.get("leadNotes")), 200)
+            )
         if lead_bits:
             system_sections.append(
-                "\n[KNOWN LEAD CONTEXT FROM LANDING / CRM]\n"
+                "\n[LEAD]\n"
                 + "\n".join(lead_bits)
-                + "\nUse this context — do not re-ask for name/service/doctor if already known. "
-                "Age and gender are usually NOT in landing data — ask for both if unknown. Never invent age or gender. "
-                "Continue booking and medical screening from here."
+                + "\nDo not re-ask name, service, or doctor when listed. Never invent age or gender."
             )
 
         # Add Layer 2: Consolidated Summary
@@ -59,10 +66,9 @@ class PromptBuilder:
             facts = memory_ctx.summary.get("facts", [])
             prefs = memory_ctx.summary.get("preferences", [])
 
-            summary_block = f"\n[CONVERSATION HISTORY SUMMARY]\n{sum_text}"
+            summary_block = f"\n[CONVERSATION HISTORY SUMMARY]\n{_clip(sum_text, 500)}"
             if facts:
-                label = "Key Facts" if entity_ctx.type not in ["CLINIC", "DOCTOR"] else "Key Patient Facts"
-                summary_block += f"\n{label}: {json.dumps(facts)}"
+                summary_block += "\nFacts: " + _clip(json.dumps(facts), 200)
             if prefs:
                 summary_block += f"\nKnown Preferences: {', '.join(prefs)}"
             system_sections.append(summary_block)
@@ -70,8 +76,14 @@ class PromptBuilder:
         # Add Layer 3: Pending Summary Add-ons + language preference
         lang_prefs: list[str] = []
         if memory_ctx.pending_addons:
-            addons_list = [f"- [{a['type']}] {a['content']}" for a in memory_ctx.pending_addons]
-            system_sections.append("\n[RECENTLY DISCOVERED FACTS]\n" + "\n".join(addons_list))
+            skip_types = {"BOOKING_DRAFT", "LANGUAGE_PREFERENCE"}
+            addons_list = [
+                f"- [{a['type']}] {_clip(str(a.get('content') or ''), 160)}"
+                for a in memory_ctx.pending_addons
+                if (a.get("type") or "").upper() not in skip_types
+            ][:4]
+            if addons_list:
+                system_sections.append("\n[PATIENT FACTS]\n" + "\n".join(addons_list))
             lang_prefs = [
                 a["content"]
                 for a in memory_ctx.pending_addons
@@ -96,25 +108,43 @@ class PromptBuilder:
                 clinic = entity_ctx.live_business_context.get("clinic") or {}
                 doctors = entity_ctx.live_business_context.get("doctors") or []
                 services = entity_ctx.live_business_context.get("services") or []
-                doctor_line = ", ".join(
-                    (
-                        f"{d.get('name')} ({d.get('specialization') or 'Consultant'}; "
-                        f"days={','.join(d.get('availabilityDays') or []) or 'n/a'}; "
-                        f"hours={d.get('availabilityHours') or 'n/a'})"
+                doctor_lines = []
+                for d in doctors[:8]:
+                    if not d.get("name"):
+                        continue
+                    days = ", ".join(d.get("availabilityDays") or []) or "days not set"
+                    hours = d.get("availabilityHours") or "hours not set"
+                    fee = d.get("consultationFee")
+                    fee_bit = f", fee ₹{fee}" if fee not in (None, "") else ""
+                    visits = [
+                        s.get("name")
+                        for s in (d.get("services") or [])[:4]
+                        if isinstance(s, dict) and s.get("name")
+                    ]
+                    visit_bit = f"; visits: {', '.join(visits)}" if visits else ""
+                    doctor_lines.append(
+                        f"- {d.get('name')}, {d.get('specialization') or 'Consultant'}"
+                        f"{fee_bit}; {days}; {hours}{visit_bit}"
                     )
-                    for d in doctors[:8]
-                    if d.get("name")
-                )
-                service_line = ", ".join(
-                    f"{s.get('name')} ₹{s.get('price')}" for s in services[:8] if s.get("name")
-                )
+                service_lines = []
+                for s in services[:8]:
+                    if not s.get("name"):
+                        continue
+                    desc = _clip(str(s.get("description") or ""), 140)
+                    price = s.get("price")
+                    price_bit = f", ₹{price}" if price not in (None, "") else ""
+                    service_lines.append(
+                        f"- {s.get('name')}, {s.get('durationMinutes') or 30} min{price_bit}"
+                        + (f" — {desc}" if desc else "")
+                    )
                 compact = (
-                    f"Clinic: {clinic.get('name') or entity_ctx.name}\n"
-                    f"Phone: {clinic.get('phone') or 'N/A'}\n"
-                    f"Doctors: {doctor_line or 'Use get_doctors'}\n"
-                    f"Services: {service_line or 'Use get_services'}\n"
-                    "Only quote doctor days/hours from this card or get_doctors. "
-                    "Always check_availability before promising a slot."
+                    f"Clinic: {clinic.get('name') or entity_ctx.name}. "
+                    f"Phone: {clinic.get('phone') or 'N/A'}.\n"
+                    "Doctors on the roster. Days and hours are their real schedule:\n"
+                    + ("\n".join(doctor_lines) or "- none on file")
+                    + "\nServices and procedures on the catalog. Price and duration are the real ones:\n"
+                    + ("\n".join(service_lines) or "- none on file")
+                    + "\nAn open time is real only when check_availability returns it for that date."
                 )
                 system_sections.append(f"\n[LIVE CLINIC CARD]\n{compact}")
             else:
@@ -157,21 +187,16 @@ class PromptBuilder:
                 f"Today: {now.strftime('%Y-%m-%d')} | Tomorrow: {tomorrow.strftime('%Y-%m-%d')}"
             )
 
-        system_sections.append(
-            "\n[CHECKLIST] Continue thread → info≠book → book only with clear intent + "
-            "check_availability → confirm with full details → use patient language.\n"
-            "[SLOTS RULE] Never list specific open appointment slots unless the patient "
-            "asked about availability/slots or is clearly booking. Doctor days/hours from "
-            "the clinic card are OK for info questions; live slot lists are not."
-        )
-
         # Combine into master system instruction
         system_content = "\n\n".join(system_sections)
         messages.append({"role": "system", "content": system_content})
 
         # Add Layer 1: Recent Conversation Messages
         if memory_ctx.recent_messages:
-            messages.extend(memory_ctx.recent_messages)
+            for item in memory_ctx.recent_messages[-6:]:
+                content = _clip(str(item.get("content") or ""), 350)
+                if content:
+                    messages.append({"role": item.get("role") or "user", "content": content})
 
         # Add Current User Message
         messages.append({"role": "user", "content": current_user_message})

@@ -37,8 +37,6 @@ class AIOrchestrator:
         "get_doctors",
         "get_services",
         "faq_lookup",
-        "knowledge_base_search",
-        "get_entity_info",
         "request_human_handoff",
     ]
     _TOOLS_STATUS = [
@@ -49,14 +47,10 @@ class AIOrchestrator:
         "request_human_handoff",
     ]
     _TOOLS_BOOKING = [
-        "get_patient",
-        "get_lead",
         "get_doctors",
-        "get_services",
         "check_availability",
         "book_appointment",
         "reschedule_appointment",
-        "fetch_appointment",
         "request_human_handoff",
     ]
 
@@ -79,7 +73,7 @@ class AIOrchestrator:
         if booking_flow.is_status_ask(user_message):
             return list(self._TOOLS_STATUS), 2, "status"
         if booking_flow.is_book_entry(user_message) or booking_flow.is_reschedule(user_message):
-            return list(self._TOOLS_BOOKING), 3, "booking"
+            return list(self._TOOLS_BOOKING), 2, "booking"
         if looks_like_clinic_faq(user_message):
             return list(self._TOOLS_INFO), 2, "info"
 
@@ -109,13 +103,11 @@ class AIOrchestrator:
         if any(
             k in msg
             for k in (
-                "book", "appoint", "slot", "schedule", "reschedule", "available",
-                "availability", "tomorrow", "today", "monday", "tuesday",
-                "wednesday", "thursday", "friday", "saturday", " am", " pm",
-                "age", "gender", "routine", "cleaning", "checkup", "check-up",
+                "book", "appoint", "slot", "schedule", "reschedule",
+                "available", "availability",
             )
         ):
-            return list(self._TOOLS_BOOKING), 3, "booking"
+            return list(self._TOOLS_BOOKING), 2, "booking"
 
         if any(
             k in blob
@@ -136,13 +128,19 @@ class AIOrchestrator:
         ):
             return list(self._TOOLS_INFO), 2, "info"
 
-        # Ambiguous follow-ups (e.g. "yes", "11 am") — keep booking tools if recent was booking.
-        return list(self._TOOLS_BOOKING), 3, "booking"
+        # A short follow-up keeps booking tools only when the recent thread is already booking.
+        recent_is_booking = any(
+            k in recent
+            for k in ("book", "appoint", "slot", "schedule", "reschedule", "available")
+        )
+        if recent_is_booking:
+            return list(self._TOOLS_BOOKING), 2, "booking"
+        return list(self._TOOLS_CHAT), 1, "chat"
 
     # Max tokens for pack.
     def _max_tokens_for_pack(self, pack: str, tools_enabled: bool) -> int:
-        if pack in ("greet", "outro", "ack", "close"):
-            return 120
+        if pack in ("greet", "outro", "ack", "close", "chat"):
+            return 160
         if pack == "info":
             return 250
         if pack == "status":
@@ -176,12 +174,29 @@ class AIOrchestrator:
         "I didn't quite catch that. Mind sending it again, or say staff if you'd rather talk to someone?"
     )
 
-    # Fast greeting reply.
+    # Greeting the clinic typed in AI settings. Empty when none is saved.
+    @staticmethod
+    def _saved_greeting(entity_ctx) -> str:
+        live = getattr(entity_ctx, "live_business_context", None) or {}
+        ai = live.get("aiConfig") or {}
+        meta = ai.get("metadata") if isinstance(ai.get("metadata"), dict) else {}
+        text = str(meta.get("greetingMessage") or "").strip()
+        if not text:
+            for line in str(ai.get("customInstructions") or "").splitlines():
+                if line.strip().lower().startswith("greeting:"):
+                    text = line.split(":", 1)[1].strip()
+                    break
+        if len(text) > 500:
+            text = text[:500].rstrip()
+        return text
+
+    # Fast greeting reply. Uses the clinic's saved line so each clinic can edit it.
     def _fast_greeting_reply(
         self,
         memory_ctx,
         request_metadata: Optional[Dict[str, Any]],
         clinic_name: str,
+        entity_ctx=None,
     ) -> str:
         meta = request_metadata or {}
         name = (meta.get("participantName") or "").strip() or "there"
@@ -193,6 +208,11 @@ class AIOrchestrator:
                     lang = "hinglish"
                 elif "english" in content:
                     lang = "english"
+        saved = self._saved_greeting(entity_ctx) if entity_ctx is not None else ""
+        if saved:
+            if lang is None:
+                return f"{saved}\nHinglish theek rahegi ya English?"
+            return saved
         if lang is None:
             return (
                 f"Hi {name} — {clinic_name} this side. Booking, fees, doctors, jo bhi chahiye pooch lijiye.\n"
@@ -863,7 +883,7 @@ class AIOrchestrator:
                 run_llm = True
                 pack = "booking"
                 tool_names = list(self._TOOLS_BOOKING)
-                max_tool_turns = 3
+                max_tool_turns = 2
                 tool_schemas = tool_registry.get_openrouter_schemas(
                     entity_ctx.capabilities,
                     tool_names=tool_names,
@@ -887,6 +907,17 @@ class AIOrchestrator:
                     final_text = (
                         "Hinglish theek rahegi ya English? Jo comfortable ho woh likh dena.\n"
                         "Hinglish or English — whichever is easier."
+                    )
+                elif (
+                    step == "NEED_NAME"
+                    and not booking_flow.is_usable_patient_name(draft.get("patientName"))
+                    and booking_flow.parse_patient_name(request.message) is None
+                    and not booking_flow.is_book_intent(request.message)
+                ):
+                    final_text = (
+                        "Poora naam chahiye — 3 letters se lamba, jaise Ananya."
+                        if lang == "hinglish"
+                        else "Please send the full name. It needs to be more than 3 letters, like Ananya."
                     )
                 elif (
                     step == "NEED_AGE"
@@ -928,12 +959,16 @@ class AIOrchestrator:
                     memory_ctx,
                     request.metadata or {},
                     clinic_name,
+                    entity_ctx,
                 )
             logger.info(f"[{request_id}] Fast {pack} path (no LLM): {final_text[:80]}")
         else:
             run_llm = True
 
         if run_llm:
+            saved_name = (draft or {}).get("patientName") if isinstance(draft, dict) else None
+            if booking_flow.is_usable_patient_name(saved_name):
+                tool_context["participant_name"] = saved_name
             # 5. Build Messages Array
             messages = prompt_builder.build_prompt_messages(
                 entity_ctx=entity_ctx,
@@ -1088,6 +1123,7 @@ class AIOrchestrator:
                         tc.tool_name in ("book_appointment", "reschedule_appointment")
                         and isinstance(tc.result, dict)
                         and not tc.result.get("error")
+                        and tc.result.get("appointmentId")
                         for tc in executed_tool_calls
                     )
                     if booked_ok:
@@ -1102,6 +1138,7 @@ class AIOrchestrator:
                                 )
                                 and isinstance(tc.result, dict)
                                 and not tc.result.get("error")
+                                and tc.result.get("appointmentId")
                             ),
                             {},
                         )
@@ -1296,6 +1333,7 @@ class AIOrchestrator:
                     in ("book_appointment", "reschedule_appointment")
                     and isinstance(getattr(tc, "result", None), dict)
                     and not tc.result.get("error")
+                    and tc.result.get("appointmentId")
                     for tc in tools
                 )
                 if booked_ok:
@@ -1304,6 +1342,9 @@ class AIOrchestrator:
                         for tc in reversed(tools)
                         if getattr(tc, "tool_name", None)
                         in ("book_appointment", "reschedule_appointment")
+                        and isinstance(getattr(tc, "result", None), dict)
+                        and not tc.result.get("error")
+                        and tc.result.get("appointmentId")
                     )
                     aid = book_res.get("appointmentId")
                     adate = book_res.get("date") or draft.get("date")

@@ -9,14 +9,13 @@ For the end-to-end message pipeline, see [`../../CGS_AI_FLOW.md`](../../CGS_AI_F
 ## Top-level layout
 
 ```text
-ai_service/
+QBITS_AI_API/
 ├── main.py              # App entry: lifespan, CORS, /health, mounts /ai/v1
 ├── requirements.txt     # Python dependencies
-├── .env / .env.example  # Secrets & model config (do not commit .env)
+├── .env                 # Secrets and model config (do not commit)
 ├── alembic.ini          # Alembic config for PostgreSQL migrations
 ├── alembic/             # DB migration scripts
 ├── tests/               # Pytest suite
-├── tmp_purge_canned.py  # One-off ops script (not runtime)
 └── app/                 # Application package
 ```
 
@@ -25,10 +24,9 @@ ai_service/
 | `main.py` | Creates FastAPI app, starts summary worker on lifespan, mounts routes |
 | `requirements.txt` | pip packages |
 | `.env` | `DATABASE_URL` (PostgreSQL), `OPENROUTER_*`, `CGS_*`, models, timeouts |
-| `app/db/models.py` | PostgreSQL ORM models (entities, conversations, messages, summaries, addons, usage) |
+| `app/db/models.py` | AI-only tables: entities, conversations, messages, summaries, addons, usage |
 | `alembic/` | Schema migrations for the dedicated AI PostgreSQL database |
-| `tests/` | Health, entities, tools, memory tests |
-| `tmp_purge_canned.py` | Manual DB cleanup helper — not part of the server |
+| `tests/` | Public health and internal diagnostics checks |
 
 ---
 
@@ -180,9 +178,9 @@ CGS  →  POST /ai/v1/generate
 ## Quick start
 
 ```bash
-cd backend/ai_service
+cd Backend/QBITS_AI_API
 pip install -r requirements.txt
-# copy .env.example → .env and set OPENROUTER_API_KEY + CGS_INTERNAL_*
+# set OPENROUTER_API_KEY, DATABASE_URL, and CGS_INTERNAL_* in .env
 python main.py
 ```
 

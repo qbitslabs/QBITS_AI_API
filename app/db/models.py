@@ -1,5 +1,6 @@
 # AI Postgres access: models.
-# SQLAlchemy models/session for the dedicated AI database only.
+# AI-only state: entities, memory, summaries, usage. Clinics, patients,
+# appointments, leads, and invoices stay in the CGS database.
 import uuid
 from datetime import datetime
 from sqlalchemy import (

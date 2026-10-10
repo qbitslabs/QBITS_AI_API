@@ -1,10 +1,11 @@
 # FastAPI entry for the CGS AI service: lifespan, CORS, health, /ai/v1.
 # Uses dedicated AI Postgres, not the CGS clinic database.
+import os
 import time
 import uuid
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -13,12 +14,16 @@ from app.core.logging import logger
 from app.db.session import init_db
 from app.api.routes import router as ai_router
 from app.core.http_client import close_http_client
+from app.core.security import verify_internal_api_key
 from app.memory.summary_worker import summary_worker_loop
 
 
 # Lifespan.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("CGS_AI_SKIP_STARTUP") == "1":
+        yield
+        return
     logger.info("Initializing CGS AI Service database...")
     await init_db()
     stop_event = asyncio.Event()
@@ -75,21 +80,23 @@ async def correlation_id_middleware(request: Request, call_next):
     return response
 
 
-# Health check endpoint confirming API and LLM provider readiness.
+# Health check. Public callers only learn that the process is up.
 @app.get("/health", tags=["Health"])
 async def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/internal/diagnostics", tags=["Health"], dependencies=[Depends(verify_internal_api_key)])
+async def internal_diagnostics():
     provider = "groq" if "groq.com" in settings.llm_base_url else "openrouter"
     return {
         "status": "ok",
         "service": "cgs-ai-service",
         "environment": settings.APP_ENV,
         "provider": provider,
-        "base_url": settings.llm_base_url,
+        "llm_configured": bool(settings.api_key),
         "default_model": settings.DEFAULT_MODEL,
         "fallback_model": settings.FALLBACK_MODEL,
-        "fallback_model_2": settings.FALLBACK_MODEL_2,
-        "llm_configured": bool(settings.api_key),
-        "openrouter_configured": bool(settings.api_key),
     }
 
 

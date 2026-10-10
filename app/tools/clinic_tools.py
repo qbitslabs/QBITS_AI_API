@@ -257,7 +257,15 @@ class BookAppointmentTool(BaseCgsTool):
     async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Any:
         clinic_id = self._clinic_id(context)
         phone = context.get("participant_id")
-        patient_name = arguments.get("patientName") or context.get("participant_name") or "Patient"
+        typed = (arguments.get("patientName") or "").strip()
+        known = (context.get("participant_name") or "").strip()
+        from app.services.booking_flow import is_usable_patient_name
+        if is_usable_patient_name(typed):
+            patient_name = typed
+        elif is_usable_patient_name(known):
+            patient_name = known
+        else:
+            patient_name = typed or known or "Patient"
         doctor_id = arguments.get("doctorId") or context.get("doctor_id")
 
         allergies = arguments.get("allergies")
@@ -291,6 +299,15 @@ class BookAppointmentTool(BaseCgsTool):
         )
         if res.status_code in (200, 201):
             data = res.json().get("data") or {}
+            status = str(data.get("status") or "").upper()
+            if not data.get("appointmentId") or status in ("CANCELLED", "NO_SHOW", "FAILED"):
+                return {
+                    "error": "Booking was not saved.",
+                    "replyInstruction": (
+                        "BOOKING FAILED. Tell the patient it was NOT confirmed and offer another available slot. "
+                        "Do not say the appointment is booked."
+                    ),
+                }
             data["replyInstruction"] = (
                 "SUCCESS: Appointment is booked. Your next message to the patient MUST clearly state: "
                 "confirmed + service + doctor + date + time (IST). "
@@ -362,49 +379,6 @@ class RequestHumanHandoffTool(BaseCgsTool):
         return {"error": f"Failed to request handoff: {res.text}"}
 
 
-# Get lead tool.
-class GetLeadTool(BaseCgsTool):
-    name = "get_lead"
-    description = "Look up or capture a lead by phone so the clinic CRM stays up to date."
-    parameters = {
-        "type": "object",
-        "properties": {
-            "phone": {"type": "string", "description": "Lead phone number."},
-            "name": {"type": "string", "description": "Lead or patient name if known."},
-            "interestedService": {"type": "string", "description": "Treatment the lead asked about."},
-            "intent": {"type": "string", "description": "HIGH, MEDIUM, or LOW."},
-        },
-        "required": [],
-    }
-
-    # Execute.
-    async def execute(self, arguments: Dict[str, Any], context: Dict[str, Any]) -> Any:
-        clinic_id = self._clinic_id(context)
-        url = f"{settings.CGS_INTERNAL_URL}/cgs_api/v1/internal/ai/lead"
-        client = get_http_client()
-        res = await client.post(
-            url,
-            json={
-                k: v
-                for k, v in {
-                    "clinicId": clinic_id,
-                    "phone": arguments.get("phone") or context.get("participant_id"),
-                    "name": arguments.get("name")
-                    or context.get("participant_name")
-                    or "WhatsApp Lead",
-                    "interestedService": arguments.get("interestedService"),
-                    "intent": arguments.get("intent") or "MEDIUM",
-                }.items()
-                if v is not None and v != ""
-            },
-            headers=self._get_headers(context),
-            timeout=10,
-        )
-        if res.status_code in (200, 201):
-            return res.json().get("data")
-        return {"error": f"Failed to fetch or capture lead: {res.text}"}
-
-
 # Move an existing appointment to a new date/time. Required: date, time.
 class RescheduleAppointmentTool(BaseCgsTool):
     name = "reschedule_appointment"
@@ -462,6 +436,15 @@ class RescheduleAppointmentTool(BaseCgsTool):
         )
         if res.status_code in (200, 201):
             data = res.json().get("data") or {}
+            status = str(data.get("status") or "").upper()
+            if not data.get("appointmentId") or status in ("CANCELLED", "NO_SHOW", "FAILED"):
+                return {
+                    "error": "Appointment was not moved.",
+                    "replyInstruction": (
+                        "RESCHEDULE FAILED. Tell the patient it was NOT moved and offer another slot. "
+                        "Do not say the appointment is confirmed on the new time."
+                    ),
+                }
             data["replyInstruction"] = (
                 "SUCCESS: Appointment was moved. Tell the patient the new service, "
                 "doctor, date and time (IST). Do not say a new booking was created."

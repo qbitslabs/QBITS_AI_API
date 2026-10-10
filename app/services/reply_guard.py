@@ -15,7 +15,6 @@ LEAK_PATTERNS = (
     r"\bfetch_appointment\b",
     r"\bget_doctors\b",
     r"\bget_patient\b",
-    r"\bget_lead\b",
     r"\bget_services\b",
     r"\bfaq_lookup\b",
     r"\brequest_human_handoff\b",

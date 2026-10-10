@@ -24,6 +24,42 @@ def invalidate_context_cache(clinic_id: Optional[str] = None) -> int:
     return 0
 
 
+def _instructions_only(text: str) -> str:
+    kept = []
+    for line in (text or "").splitlines():
+        low = line.strip().lower()
+        if low.startswith("receptionist name:") or low.startswith("greeting:"):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _clip(text: str, limit: int) -> str:
+    body = (text or "").strip()
+    if len(body) <= limit:
+        return body
+    return body[:limit].rstrip() + "…"
+
+
+_ROSTER_HEADINGS = (
+    "Doctors:",
+    "Consultation Details:",
+    "Timings:",
+    "Services & Treatments:",
+)
+
+
+def _drop_roster_sections(text: str) -> str:
+    kept = []
+    for block in (text or "").split("\n\n"):
+        head = block.strip().split("\n", 1)[0].strip()
+        if head in _ROSTER_HEADINGS:
+            continue
+        if block.strip():
+            kept.append(block.strip())
+    return "\n\n".join(kept)
+
+
 # Clinic entity adapter.
 class ClinicEntityAdapter(BaseEntityAdapter):
     # Resolve.
@@ -96,56 +132,52 @@ class ClinicEntityAdapter(BaseEntityAdapter):
             or ai.get("language")
             or "auto"
         )
-        greeting = (
-            meta.get("greetingMessage")
-            or ai.get("greetingMessage")
-            or f"Namaste! {clinic_name} me aapka swagat hai. Main kaise madad kar sakti hoon?"
+        raw_instructions = meta.get("conversationInstructions") or _instructions_only(
+            ai.get("customInstructions") or ""
         )
-        instructions = (
-            meta.get("conversationInstructions")
-            or ai.get("customInstructions")
-            or "Be warm and natural like a WhatsApp receptionist. Prefer Hindi/Hinglish when the patient does; keep replies short."
+        instructions = _clip(
+            raw_instructions
+            or "Welcome the patient, listen carefully, and help them with the clinic's doctors, visits, and bookings.",
+            900,
         )
-        knowledge = (ai.get("systemPrompt") or "").strip()
+        knowledge = _clip(_drop_roster_sections((ai.get("systemPrompt") or "").strip()), 1200)
         if not knowledge:
             knowledge_bits = [
-                meta.get("clinicInformation") and f"Clinic Information:\n{meta.get('clinicInformation')}",
-                meta.get("servicesTreatments") and f"Services & Treatments:\n{meta.get('servicesTreatments')}",
-                meta.get("doctorsInfo") and f"Doctors:\n{meta.get('doctorsInfo')}",
-                meta.get("consultationDetails") and f"Consultation Details:\n{meta.get('consultationDetails')}",
-                meta.get("timings") and f"Timings:\n{meta.get('timings')}",
+                meta.get("clinicInformation") and f"About the clinic:\n{meta.get('clinicInformation')}",
                 meta.get("faqs") and f"FAQs:\n{meta.get('faqs')}",
             ]
-            knowledge = "\n\n".join([b for b in knowledge_bits if b])
+            knowledge = _clip("\n\n".join([b for b in knowledge_bits if b]), 1200)
 
-        # Qualification + handoff are fixed (not configurable) to keep clinic setup simple.
-        # Keep this compact — every token here is re-sent on every OpenRouter turn.
         sections: List[str] = [
-            f"You are {receptionist}, AI receptionist for {clinic_name}. Tone: {tone}. "
-            f"Default language setting: {language} (auto = ask once Hinglish or English, then stick to it).",
-            f"Greeting when starting:\n\"{greeting}\"",
-            f"Instructions:\n{instructions}",
-            "RULES:\n"
-            "- Read recent chat + lead facts; continue the same thread. Do not restart or invent topics.\n"
-            "- Ask Hinglish vs English once if unknown; if LANGUAGE_PREFERENCE exists, do not ask again.\n"
-            "- Short replies (1–3 sentences). Ask 1–2 things at a time.\n"
-            "- INFO (fees/timings/services/doctors): answer with tools/knowledge. Do NOT book.\n"
-            "- BOOK only when patient clearly wants to book. Ask doctor first if several, then numbered services; patient replies 1, 2, …\n"
-            "- Out of scope: decline politely; offer clinic help or staff. Do NOT book.\n"
-            "- Collect name, age, gender before/while booking. NEVER invent age/gender.\n"
-            "- If landing lead already has name/service/doctor, do not re-ask.\n"
-            "- Before NEW book: brief BP/sugar/allergies screen. Pass age, gender, allergies, medicalHistoryNotes.\n"
-            "- After doctor+service are chosen, check slots with a date only; never guess UUIDs.\n"
-            "- Patient text: never mention tools, UUID, doctorId, JSON, or internal reasoning.\n"
-            "- Empty slots / leave / off-duty → say unavailable; do NOT book.\n"
-            "- Confirm booking status via get_patient first; never say unbooked if tool shows CONFIRMED.\n"
-            "- NEVER say confirmed unless book_appointment succeeded. Then include service, doctor, date, time IST.\n"
-            "- Preferring a doctor is NOT a handoff. Handoff only for human/staff request or emergency (severity=critical).\n"
-            "- Resolve today/tomorrow from CURRENT DATE block. Never invent hours or medical advice.",
+            f"You are {receptionist}, the WhatsApp receptionist for {clinic_name}. "
+            f"Your tone is {tone}. Language setting: {language}.",
+            "Manner:\n"
+            "Be polite, patient, and genuinely helpful. Sound like a real receptionist, not a script.\n"
+            "Acknowledge what the patient just said, then help with the next useful step.\n"
+            "Use simple words. Ask one clear question at a time.\n"
+            "If you cannot do something, say so kindly and offer to connect them with the clinic staff.\n"
+            "Once they choose Hinglish or English, stay in that language unless they switch.",
+            f"Clinic instructions:\n{instructions}",
+            "Accuracy:\n"
+            "- Continue this same conversation. Do not restart it or invent a new topic.\n"
+            "- Doctors, working days, and hours come only from the live clinic card.\n"
+            "- Fees, visit length, and what a service includes come only from the services on that card.\n"
+            "- Never invent a doctor, a fee, a working hour, or an open appointment time.\n"
+            "- When they ask what is free, use check_availability and mention only the times it returns.\n"
+            "- Say a visit is booked only after book_appointment returns an appointmentId. "
+            "Then repeat the service, the doctor, the date, and the time.\n"
+            "- If that time was just taken, apologize briefly and offer the times that are still open.\n"
+            "- Do not diagnose or give medical advice. Invite them to discuss that with the doctor.\n"
+            "- Never show tool names, UUIDs, or JSON.\n"
+            "- Offer a person when they ask for staff, seem stuck, or describe an emergency.",
         ]
 
         if knowledge:
-            sections.append(f"Clinic knowledge base:\n{knowledge}")
+            sections.append(
+                "About this clinic and its FAQs. If this wording disagrees with the live clinic card, "
+                "trust the card for doctors, hours, fees, and services:\n"
+                + knowledge
+            )
 
         if ai.get("isAiEnabled") is False:
             sections.append(

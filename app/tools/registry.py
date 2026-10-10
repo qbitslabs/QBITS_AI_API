@@ -4,7 +4,6 @@ from typing import Dict, List, Any, Optional
 from app.tools.base import BaseTool
 from app.tools.clinic_tools import (
     GetPatientTool,
-    GetLeadTool,
     GetDoctorsTool,
     GetServicesTool,
     CheckAvailabilityTool,
@@ -13,11 +12,7 @@ from app.tools.clinic_tools import (
     FetchAppointmentTool,
     RequestHumanHandoffTool,
 )
-from app.tools.generic_tools import (
-    EntityInfoTool,
-    KnowledgeBaseSearchTool,
-    FaqLookupTool,
-)
+from app.tools.generic_tools import FaqLookupTool
 
 
 # Tool registry.
@@ -31,7 +26,6 @@ class ToolRegistry:
     def _register_default_tools(self):
         # Register Clinic Tools
         self.register(GetPatientTool())
-        self.register(GetLeadTool())
         self.register(GetDoctorsTool())
         self.register(GetServicesTool())
         self.register(CheckAvailabilityTool())
@@ -39,10 +33,6 @@ class ToolRegistry:
         self.register(RescheduleAppointmentTool())
         self.register(FetchAppointmentTool())
         self.register(RequestHumanHandoffTool())
-
-        # Register Generic Tools
-        self.register(EntityInfoTool())
-        self.register(KnowledgeBaseSearchTool())
         self.register(FaqLookupTool())
 
     # Register.

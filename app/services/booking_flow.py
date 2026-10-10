@@ -1,4 +1,4 @@
-# Hybrid WhatsApp booking wizard: language, doctor, numbered service, age, gender, screen.
+# Hybrid WhatsApp booking wizard: language, name when the profile is too short, doctor, service, age, gender, screen.
 # Then the model owns slots and book_appointment; never invents doctor UUIDs.
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ PATIENT_SCREENING_TYPE = "PATIENT_SCREENING"
 # Static intake ends at medical screen; AI owns date/time/slots/book.
 STEPS = (
     "NEED_LANGUAGE",
+    "NEED_NAME",
     "NEED_DOCTOR",
     "NEED_SERVICE",
     "NEED_AGE",
@@ -24,6 +25,11 @@ STEPS = (
     "NEED_AI_SLOTS",
     "DONE",
 )
+
+# Webhook profile names this short are not a real patient name.
+_NAME_PLACEHOLDERS = frozenset({
+    "patient", "user", "unknown", "whatsapp", "contact", "guest", "there",
+})
 
 DEFAULT_SERVICE = "General Consultation"
 
@@ -381,10 +387,11 @@ def confirmed_booking_facts(
                 name in ("book_appointment", "reschedule_appointment")
                 and isinstance(result, dict)
                 and not result.get("error")
+                and result.get("appointmentId")
             ):
                 booking = result
                 break
-    if not booking:
+    if not booking or not booking.get("appointmentId"):
         return None
     availability = None
     for tc in reversed(calls):
@@ -417,6 +424,7 @@ def empty_draft() -> Dict[str, Any]:
     return {
         "step": "NEED_LANGUAGE",
         "language": None,
+        "patientName": None,
         "doctorId": None,
         "doctorName": None,
         "doctorOptions": [],
@@ -715,6 +723,7 @@ def is_cancel(message: str, step: Optional[str] = None) -> bool:
 
 _STEP_FIELDS = {
     "NEED_LANGUAGE": ("language",),
+    "NEED_NAME": ("patientName",),
     "NEED_DOCTOR": ("doctorId",),
     "NEED_SERVICE": ("service",),
     "NEED_AGE": ("age",),
@@ -824,6 +833,12 @@ def resume_booking_line(step: str, lang: str) -> str:
         return (
             "Booking aage badhane ke liye — Hinglish theek rahegi ya English?\n"
             "Want to keep going? Hinglish or English is fine."
+        )
+    if step == "NEED_NAME":
+        return _t(
+            "Poora naam likh dena — 3 letters se lamba, jaise Ananya.",
+            "Please send the full name — more than 3 letters, like Ananya.",
+            lang,
         )
     if step == "NEED_DOCTOR":
         return _t(
@@ -1136,12 +1151,59 @@ def parse_language(message: str) -> Optional[str]:
     return None
 
 
+# True when a webhook or typed name is long enough to save.
+def is_usable_patient_name(name: Optional[str]) -> bool:
+    raw = (name or "").strip()
+    if not raw:
+        return False
+    if raw.lower() in _NAME_PLACEHOLDERS:
+        return False
+    letters = "".join(ch for ch in raw if ch.isalpha())
+    return len(letters) > 3
+
+
+# Keep a long webhook profile name. A short one stays empty so the wizard asks.
+def adopt_known_name(draft: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
+    if is_usable_patient_name(draft.get("patientName")):
+        return
+    known = str((meta or {}).get("participantName") or "").strip()
+    if is_usable_patient_name(known):
+        draft["patientName"] = known
+
+
+# Name reply on the name step. Language words and short profiles are not names.
+def parse_patient_name(message: str) -> Optional[str]:
+    text = re.sub(r"\s+", " ", (message or "").strip())
+    if not text or "?" in text or len(text) > 40:
+        return None
+    if parse_language(text) or is_book_intent(text) or is_cancel(text):
+        return None
+    if any(ch.isdigit() for ch in text):
+        return None
+    if any(not (ch.isalpha() or ch in " .'-") for ch in text):
+        return None
+    cleaned = text.strip(" .'-")
+    if cleaned.lower() in {
+        "male", "female", "other", "none", "no", "yes", "ok", "okay", "nahi",
+    }:
+        return None
+    if not is_usable_patient_name(cleaned):
+        return None
+    return cleaned
+
+
 # Prompt for step.
 def prompt_for_step(step: str, lang: str, draft: Dict[str, Any]) -> str:
     if step == "NEED_LANGUAGE":
         return (
             "Bilkul — booking start karte hain. Hinglish theek rahegi ya English mein baat karein?\n"
             "Happy to book you in. Shall we talk in Hinglish or English?"
+        )
+    if step == "NEED_NAME":
+        return _t(
+            "Theek hai. Patient ka poora naam kya hai? 3 letters se lamba likh dena, jaise Ananya.",
+            "Great. What is the patient's full name? It needs to be more than 3 letters, like Ananya.",
+            lang,
         )
     if step == "NEED_DOCTOR":
         return format_doctor_menu(draft, lang)
@@ -1368,6 +1430,9 @@ def next_missing_step(draft: Dict[str, Any], meta: Optional[Dict[str, Any]] = No
         return "NEED_AI_SLOTS"
     if not draft.get("language"):
         return "NEED_LANGUAGE"
+    adopt_known_name(draft, meta)
+    if not is_usable_patient_name(draft.get("patientName")):
+        return "NEED_NAME"
     resolve_doctor(draft, meta)
     if not draft.get("doctorId"):
         return "NEED_DOCTOR"
@@ -1416,8 +1481,20 @@ def apply_message_to_draft(
         if lang:
             draft["language"] = lang
 
+    adopt_known_name(draft, meta)
+    captured_name = False
+    if (
+        draft.get("language")
+        and not is_usable_patient_name(draft.get("patientName"))
+        and parse_language(msg) is None
+    ):
+        parsed_name = parse_patient_name(msg)
+        if parsed_name:
+            draft["patientName"] = parsed_name
+            captured_name = True
+
     resolve_doctor(draft, meta)
-    if draft.get("language") and not draft.get("doctorId"):
+    if draft.get("language") and not draft.get("doctorId") and not captured_name:
         doc = parse_doctor_choice(msg, draft.get("doctorOptions") or [], None)
         if doc and doc.get("id"):
             prev = draft.get("doctorId")
@@ -1427,16 +1504,16 @@ def apply_message_to_draft(
                 draft["service"] = None
                 draft["serviceOptions"] = []
 
-    if draft.get("doctorId") and not draft.get("service"):
+    if draft.get("doctorId") and not draft.get("service") and not captured_name:
         s = parse_service(msg, None, draft.get("serviceOptions") or [])
         if s:
             draft["service"] = s
 
-    if draft.get("service") and not draft.get("age"):
+    if draft.get("service") and not draft.get("age") and not captured_name:
         a = parse_age(msg)
         if a:
             draft["age"] = a
-    if draft.get("service") and not draft.get("gender"):
+    if draft.get("service") and not draft.get("gender") and not captured_name:
         g = parse_gender(msg)
         if g:
             draft["gender"] = g
@@ -1448,6 +1525,7 @@ def apply_message_to_draft(
         and draft.get("service")
         and draft.get("age")
         and draft.get("gender")
+        and not captured_name
         and not draft.get("medicalHistoryNotes")
     ):
         sc = parse_screen(msg)
@@ -1495,7 +1573,9 @@ def ai_slot_handoff_system(draft: Dict[str, Any], lang: str) -> str:
         )
     return (
         "STATIC BOOKING INTAKE IS COMPLETE. You now own date/time/slots/booking.\n"
-        f"Collected: language={draft.get('language')}; service={draft.get('service')}; "
+        f"Collected: language={draft.get('language')}; "
+        f"name={draft.get('patientName') or 'unknown'}; "
+        f"service={draft.get('service')}; "
         f"age={draft.get('age')}; gender={draft.get('gender')}; screening={notes}.\n"
         "Reply in the patient's language. "
         f"Doctor already chosen: {draft.get('doctorName') or draft.get('doctorId') or 'assigned'}. "
@@ -1505,8 +1585,9 @@ def ai_slot_handoff_system(draft: Dict[str, Any], lang: str) -> str:
         "Never guess UUIDs. Never mention tool names, UUID, doctorId, or JSON to the patient. "
         "Patient reply: 1–3 short sentences listing real open slots, or ask the date. "
         "If they say No / stop / cancel / later, stop booking — do not keep asking for a date. "
-        "Then book_appointment with collected age, gender, allergies, and medicalHistoryNotes. "
-        "Never invent slots. Never re-ask language/service/age/gender/screening unless missing. "
+        "Then book_appointment with this patientName, plus collected age, gender, allergies, "
+        "and medicalHistoryNotes. "
+        "Never invent slots. Never re-ask language, name, service, age, gender, or screening unless missing. "
         "When asking for a date, add: Reply No to stop booking."
     )
 
@@ -1862,7 +1943,7 @@ async def execute_booking_tools(
             "time": matched,
             "service": service,
             "doctorId": doctor_id,
-            "patientName": tool_context.get("participant_name") or "Patient",
+            "patientName": draft.get("patientName") or tool_context.get("participant_name") or "Patient",
             "age": draft.get("age"),
             "gender": draft.get("gender"),
             "allergies": draft.get("allergies") or ["None"],
@@ -1872,43 +1953,55 @@ async def execute_booking_tools(
     book_res = await action_tool.execute(book_args, {**tool_context, "doctor_id": doctor_id})
     executed.append(ToolCallInfo(tool_name=action_name, arguments=book_args, result=book_res))
 
-    if isinstance(book_res, dict) and not book_res.get("error"):
-        draft["step"] = "DONE"
-        draft["active"] = False
-        draft["time"] = matched
-        doc = doctor_name or avail.get("doctorName") or ""
-        booked_service = (
-            (book_res.get("service") if isinstance(book_res, dict) else None)
-            or service
-        )
-        booked_date = (
-            (book_res.get("date") if isinstance(book_res, dict) else None)
-            or date
-        )
-        booked_time = (
-            (book_res.get("time") if isinstance(book_res, dict) else None)
-            or matched
-        )
-        booked_doc = (
-            (book_res.get("doctorName") if isinstance(book_res, dict) else None)
-            or doc
-        )
-        msg = format_confirmed_appointment(
-            service=booked_service,
-            doctor=booked_doc,
-            date=booked_date,
-            time=booked_time,
-            lang=lang,
-            rescheduled=is_reschedule_mode,
-        )
-        return msg, executed, draft
+    if isinstance(book_res, dict) and book_res.get("appointmentId") and not book_res.get("error"):
+        saved_status = str(book_res.get("status") or "").upper()
+        if saved_status not in ("CANCELLED", "NO_SHOW", "FAILED"):
+            draft["step"] = "DONE"
+            draft["active"] = False
+            draft["time"] = matched
+            doc = doctor_name or avail.get("doctorName") or ""
+            booked_service = (
+                (book_res.get("service") if isinstance(book_res, dict) else None)
+                or service
+            )
+            booked_date = (
+                (book_res.get("date") if isinstance(book_res, dict) else None)
+                or date
+            )
+            booked_time = (
+                (book_res.get("time") if isinstance(book_res, dict) else None)
+                or matched
+            )
+            booked_doc = (
+                (book_res.get("doctorName") if isinstance(book_res, dict) else None)
+                or doc
+            )
+            msg = format_confirmed_appointment(
+                service=booked_service,
+                doctor=booked_doc,
+                date=booked_date,
+                time=booked_time,
+                lang=lang,
+                rescheduled=is_reschedule_mode,
+            )
+            return msg, executed, draft
 
     err = (book_res or {}).get("error") if isinstance(book_res, dict) else "unknown"
     draft["step"] = "NEED_DATETIME"
+    draft["time"] = None
     logger.warning(f"Static booking failed: {err}")
+    fresh_slots: List[str] = []
+    if avail_tool:
+        fresh = await avail_tool.execute({"date": date, "doctorId": doctor_id}, tool_context)
+        executed.append(
+            ToolCallInfo(tool_name="check_availability", arguments={"date": date, "doctorId": doctor_id}, result=fresh)
+        )
+        if isinstance(fresh, dict) and not fresh.get("error"):
+            fresh_slots = list(fresh.get("availableSlots") or [])
+    slot_txt = ", ".join(fresh_slots[:8]) if fresh_slots else "none right now"
     msg = _t(
-        "Yeh slot lock nahi ho paya. Koi aur time try karein, ya staff likh dena main unse connect kar deti hoon.",
-        "That slot didn't lock. Want to try another time, or say staff and I'll connect you?",
+        f"Yeh time ab nahi mil raha. Abhi yeh times khali hain: {slot_txt}. Inme se koi chalega?",
+        f"That time was just taken, so it is not booked. I still have {slot_txt}. Which of those works?",
         lang,
     )
     return msg, executed, draft
