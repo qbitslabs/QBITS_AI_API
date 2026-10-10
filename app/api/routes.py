@@ -23,6 +23,7 @@ from app.services.entity_service import entity_service
 from app.services.ai_orchestrator import ai_orchestrator
 from app.memory.summary_processor import SummaryProcessor
 from app.core.clinic_cache import invalidate_clinic_caches
+from app.core.logging import logger
 
 router = APIRouter(dependencies=[Depends(verify_internal_api_key)])
 summary_processor = SummaryProcessor()
@@ -54,9 +55,12 @@ async def generate_response(
         if usage_payload:
             background_tasks.add_task(ai_orchestrator.forward_usage_to_cgs, usage_payload)
         return result
+    except HTTPException:
+        raise
     except Exception as err:
+        logger.exception("AI generate failed")
         err_text = str(err)
-        # OpenRouter out of credits — surface clearly (not a generic 500)
+        # Provider out of credits — surface clearly (not a generic 500)
         if "[402]" in err_text or "more credits" in err_text.lower() or "can only afford" in err_text.lower():
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,

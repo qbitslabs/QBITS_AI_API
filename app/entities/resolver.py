@@ -17,10 +17,6 @@ class EntityResolver:
         }
         self._generic_adapter = GenericEntityAdapter()
 
-    # Register adapter.
-    def register_adapter(self, entity_type: str, adapter: BaseEntityAdapter):
-        self._adapters[entity_type.upper()] = adapter
-
     # Resolve.
     async def resolve(
         self,

@@ -97,12 +97,3 @@ class SummaryMergeResponse(BaseModel):
     summary_json: Dict[str, Any]
     merged_addons_count: int
 
-
-# Usage stats response.
-class UsageStatsResponse(BaseModel):
-    entity_id: str
-    total_requests: int
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    estimated_cost: float

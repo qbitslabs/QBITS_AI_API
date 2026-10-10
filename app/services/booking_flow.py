@@ -100,7 +100,7 @@ CANCEL_EXACT = frozenset({
     "nahi book", "don't book", "dont book", "not interested",
     "no booking", "stop booking", "cancel booking", "cancel it",
     "stop it", "that's it", "thats it", "bas", "bas kar", "bas karo",
-    "baad mein", "baad me", "kal", "not today", "maybe later",
+    "baad mein", "baad me", "not today", "maybe later",
     "changed my mind", "i changed my mind", "don't want to",
     "dont want to", "nahi karna", "nahi karungi", "nahi karunga",
     "mat book", "book nahi", "appointment nahi",
@@ -485,8 +485,33 @@ def is_book_intent(message: str) -> bool:
     return any(k in lower for k in BOOK_INTENT)
 
 
+# Same phone, different person — start intake from the name.
+_SOMEONE_ELSE = (
+    "someone else", "somebody else", "another person", "another patient",
+    "different person", "different patient", "other person", "other patient",
+    "kisi aur", "kisi or", "dusre patient", "doosre patient",
+    "dusra patient", "doosra patient", "naya patient", "naye patient",
+    "mere bete", "meri beti", "mere beta", "mere papa", "mere pita",
+    "meri mummy", "meri mama", "meri maa", "mere bhai", "meri behen",
+    "meri wife", "mere husband", "meri patni", "mere pati",
+    "for my son", "for my daughter", "for my wife", "for my husband",
+    "for my father", "for my mother", "for my brother", "for my sister",
+    "for my child", "for my kid", "for my baby", "for my parents",
+    "family member", "rishtedar",
+)
+
+
+def booking_for_someone_else(message: str) -> bool:
+    lower = (message or "").strip().lower()
+    if not lower:
+        return False
+    return any(p in lower for p in _SOMEONE_ELSE)
+
+
 # New wizard start only. Cancel phrases never open booking (even if they contain "book").
 def is_book_entry(message: str) -> bool:
+    if booking_for_someone_else(message):
+        return True
     if is_cancel(message) or is_status_ask(message):
         return False
     return is_book_verb(message) or is_book_intent(message)
@@ -709,7 +734,10 @@ def draft_is_stale(
 
 
 # Is cancel. Bare "no"/"nahi" exits the wizard except on the medical screen.
+# A date or time ("kal", "Monday", "3 pm") is an answer, never a cancel.
 def is_cancel(message: str, step: Optional[str] = None) -> bool:
+    if parse_date(message) or parse_time(message):
+        return False
     lower = (message or "").strip().lower()
     bare = lower.strip("!.?, ")
     if bare in CANCEL_EXACT:
@@ -828,7 +856,15 @@ def user_asked_slots(message: str) -> bool:
 
 
 # Closing line that re-asks the field they drifted from.
-def resume_booking_line(step: str, lang: str) -> str:
+def resume_booking_line(step: str, lang: str, draft: Optional[Dict[str, Any]] = None) -> str:
+    text = _resume_booking_line(step, lang)
+    head = collected_line(draft, lang)
+    if head:
+        return f"{text}\n{head}"
+    return text
+
+
+def _resume_booking_line(step: str, lang: str) -> str:
     if step == "NEED_LANGUAGE":
         return (
             "Booking aage badhane ke liye — Hinglish theek rahegi ya English?\n"
@@ -1025,7 +1061,9 @@ def parse_time(message: str) -> Optional[str]:
 def parse_date(message: str) -> Optional[str]:
     lower = (message or "").strip().lower()
     now = _now_ist()
-    if "today" in lower or "aaj" in lower:
+    if ("today" in lower or re.search(r"\baaj\b", lower)) and not any(
+        x in lower for x in ("not today", "aaj nahi", "aaj nahin")
+    ):
         return now.strftime("%Y-%m-%d")
     if "tomorrow" in lower or re.search(r"\bkal\b", lower):
         return (now + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1163,7 +1201,10 @@ def is_usable_patient_name(name: Optional[str]) -> bool:
 
 
 # Keep a long webhook profile name. A short one stays empty so the wizard asks.
+# A "someone else" booking must not reuse the WhatsApp profile name.
 def adopt_known_name(draft: Dict[str, Any], meta: Optional[Dict[str, Any]]) -> None:
+    if draft.get("forSomeoneElse"):
+        return
     if is_usable_patient_name(draft.get("patientName")):
         return
     known = str((meta or {}).get("participantName") or "").strip()
@@ -1192,8 +1233,45 @@ def parse_patient_name(message: str) -> Optional[str]:
     return cleaned
 
 
+# One line of everything already saved, so a later question cannot drop it.
+def collected_line(draft: Optional[Dict[str, Any]], lang: str) -> str:
+    if not draft:
+        return ""
+    parts: List[str] = []
+    name = draft.get("patientName")
+    if is_usable_patient_name(name if isinstance(name, str) else None):
+        parts.append(f"naam {name}" if lang == "hinglish" else f"name {name}")
+    if draft.get("doctorName"):
+        parts.append(f"doctor {draft['doctorName']}")
+    if draft.get("service"):
+        parts.append(f"service {draft['service']}")
+    age = draft.get("age")
+    if age not in (None, "", 0):
+        parts.append(f"age {age}")
+    if draft.get("gender"):
+        parts.append(f"gender {draft['gender']}")
+    if not parts:
+        return ""
+    if lang == "hinglish":
+        return "Jo details le chuke hain: " + ", ".join(parts) + "."
+    return "Details already saved: " + ", ".join(parts) + "."
+
+
+def _with_collected(step: str, lang: str, draft: Dict[str, Any], text: str) -> str:
+    if step == "NEED_LANGUAGE":
+        return text
+    head = collected_line(draft, lang)
+    if not head:
+        return text
+    return f"{head}\n{text}"
+
+
 # Prompt for step.
 def prompt_for_step(step: str, lang: str, draft: Dict[str, Any]) -> str:
+    return _with_collected(step, lang, draft, _prompt_for_step(step, lang, draft))
+
+
+def _prompt_for_step(step: str, lang: str, draft: Dict[str, Any]) -> str:
     if step == "NEED_LANGUAGE":
         return (
             "Bilkul — booking start karte hain. Hinglish theek rahegi ya English mein baat karein?\n"
@@ -1396,6 +1474,8 @@ async def hydrate_booking_options(
 
 # Landing serviceInterested wins; else keep parsed. Do not invent a default on new bookings.
 def resolve_service(draft: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> None:
+    if draft.get("forSomeoneElse"):
+        return
     if meta and meta.get("serviceInterested"):
         draft["service"] = str(meta["serviceInterested"]).strip()
         return
@@ -1406,6 +1486,8 @@ def resolve_service(draft: Dict[str, Any], meta: Optional[Dict[str, Any]] = None
 
 
 def resolve_doctor(draft: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> None:
+    if draft.get("forSomeoneElse"):
+        return
     if draft.get("doctorId"):
         return
     choice = parse_doctor_choice("", draft.get("doctorOptions") or [], meta)
@@ -1425,8 +1507,13 @@ def next_missing_step(draft: Dict[str, Any], meta: Optional[Dict[str, Any]] = No
         if not draft.get("language"):
             draft["language"] = "english"
         resolve_service(draft, meta)
-        if not draft.get("medicalHistoryNotes"):
-            return "NEED_SCREEN"
+        adopt_known_name(draft, meta)
+        if not is_usable_patient_name(draft.get("patientName")):
+            return "NEED_NAME"
+        if not draft.get("age"):
+            return "NEED_AGE"
+        if not draft.get("gender"):
+            return "NEED_GENDER"
         return "NEED_AI_SLOTS"
     if not draft.get("language"):
         return "NEED_LANGUAGE"
@@ -1468,10 +1555,28 @@ def apply_message_to_draft(
         draft["step"] = "NEED_AI_SLOTS"
         return touch_draft(draft)
     if (draft.get("mode") or "") == "returning":
-        if not draft.get("medicalHistoryNotes"):
-            sc = parse_screen(message)
-            if sc:
-                draft.update(sc)
+        if not draft.get("language"):
+            draft["language"] = "english"
+        resolve_service(draft, meta)
+        if not is_usable_patient_name(draft.get("patientName")):
+            parsed_name = parse_patient_name(message)
+            if parsed_name:
+                draft["patientName"] = parsed_name
+        if not draft.get("age"):
+            parsed_age = parse_age(message)
+            if parsed_age:
+                draft["age"] = parsed_age
+        if not draft.get("gender"):
+            parsed_gender = parse_gender(message)
+            if parsed_gender:
+                draft["gender"] = parsed_gender
+        parsed_date = parse_date(message)
+        if parsed_date:
+            draft["date"] = parsed_date
+            draft["time"] = None
+        parsed_time = parse_time(message)
+        if parsed_time:
+            draft["time"] = parsed_time
         draft["step"] = next_missing_step(draft, meta)
         return touch_draft(draft)
     msg = (message or "").strip()
@@ -1494,26 +1599,29 @@ def apply_message_to_draft(
             captured_name = True
 
     resolve_doctor(draft, meta)
+    captured_choice = False
     if draft.get("language") and not draft.get("doctorId") and not captured_name:
         doc = parse_doctor_choice(msg, draft.get("doctorOptions") or [], None)
         if doc and doc.get("id"):
             prev = draft.get("doctorId")
             draft["doctorId"] = doc["id"]
             draft["doctorName"] = doc.get("name") or draft.get("doctorName")
+            captured_choice = True
             if prev and prev != doc["id"]:
                 draft["service"] = None
                 draft["serviceOptions"] = []
 
-    if draft.get("doctorId") and not draft.get("service") and not captured_name:
+    if draft.get("doctorId") and not draft.get("service") and not captured_name and not captured_choice:
         s = parse_service(msg, None, draft.get("serviceOptions") or [])
         if s:
             draft["service"] = s
+            captured_choice = True
 
-    if draft.get("service") and not draft.get("age") and not captured_name:
+    if draft.get("service") and not draft.get("age") and not captured_name and not captured_choice:
         a = parse_age(msg)
         if a:
             draft["age"] = a
-    if draft.get("service") and not draft.get("gender") and not captured_name:
+    if draft.get("service") and not draft.get("gender") and not captured_name and not captured_choice:
         g = parse_gender(msg)
         if g:
             draft["gender"] = g
@@ -1531,6 +1639,22 @@ def apply_message_to_draft(
         sc = parse_screen(msg)
         if sc:
             draft.update(sc)
+
+    if (
+        draft.get("language")
+        and draft.get("doctorId")
+        and draft.get("service")
+        and draft.get("age")
+        and draft.get("gender")
+        and not captured_name
+    ):
+        parsed_date = parse_date(msg)
+        if parsed_date:
+            draft["date"] = parsed_date
+            draft["time"] = None
+        parsed_time = parse_time(msg)
+        if parsed_time:
+            draft["time"] = parsed_time
 
     draft["step"] = next_missing_step(draft, meta)
     return touch_draft(draft)
@@ -1557,19 +1681,22 @@ def ai_slot_handoff_system(draft: Dict[str, Any], lang: str) -> str:
         today = today_ist_str()
         last_visit = draft.get("lastVisitDate") or "the last visit"
         return (
-            "RETURNING PATIENT BOOKING — last visit date, age, gender, and service "
-            f"are already on file from CGS (last visit {last_visit}).\n"
-            "Do NOT ask for date, age, gender, language, or service. "
-            "Only BP/sugar/allergies were collected.\n"
-            f"Collected: language={draft.get('language')}; service={draft.get('service')}; "
-            f"age={draft.get('age')}; gender={draft.get('gender')}; screening={notes}.\n"
-            f"Immediately call check_availability with date={today} only (today IST). "
+            "RETURNING PATIENT — name, age, gender, and service are already on file. "
+            "Do NOT ask for name, age, gender, language, service, or screening.\n"
+            f"Collected: name={draft.get('patientName') or 'on file'}; "
+            f"language={draft.get('language')}; service={draft.get('service')}; "
+            f"age={draft.get('age')}; gender={draft.get('gender')}; "
+            f"last visit {last_visit}.\n"
+            f"Go straight to slots. If they named a day, use that date. "
+            f"Otherwise call check_availability with date={today} (today IST). "
             "If no slots, try the next calendar day, then the day after. "
-            "Then list real open slots and wait for them to pick a time.\n"
+            "List only those real open times and wait for a time.\n"
             "doctorId is OPTIONAL — omit it. Never guess UUIDs. "
             "Never mention tools, UUID, or JSON to the patient.\n"
-            "Then book_appointment with collected age, gender, allergies, and medicalHistoryNotes.\n"
-            "If they say No / stop / cancel, stop."
+            "An unrelated word does not clear the saved details and does not cancel. "
+            "Then book_appointment with the saved name, age, and gender.\n"
+            "If they say No / stop / cancel, stop. "
+            "If they say this visit is for someone else, a new intake will start from the name."
         )
     return (
         "STATIC BOOKING INTAKE IS COMPLETE. You now own date/time/slots/booking.\n"
@@ -1588,6 +1715,7 @@ def ai_slot_handoff_system(draft: Dict[str, Any], lang: str) -> str:
         "Then book_appointment with this patientName, plus collected age, gender, allergies, "
         "and medicalHistoryNotes. "
         "Never invent slots. Never re-ask language, name, service, age, gender, or screening unless missing. "
+        "An unrelated word does not clear these details and does not cancel the booking. "
         "When asking for a date, add: Reply No to stop booking."
     )
 
@@ -1702,11 +1830,29 @@ def seed_returning_book_draft(
     last_date = facts.get("date")
     if last_date:
         draft["lastVisitDate"] = str(last_date).strip()[:10]
-    if not draft.get("age"):
-        draft["age"] = 0
-    if not draft.get("gender"):
-        draft["gender"] = "Other"
-    draft["step"] = "NEED_SCREEN"
+    name = facts.get("patientName")
+    if is_usable_patient_name(name if isinstance(name, str) else None):
+        draft["patientName"] = str(name).strip()
+    draft["step"] = next_missing_step(draft, meta)
+    return touch_draft(draft)
+
+
+# Same number, different person. Ask from the name again. Do not copy the last patient.
+def seed_someone_else_draft(
+    addons: List[Dict[str, Any]],
+    language: Optional[str] = None,
+) -> Dict[str, Any]:
+    draft = empty_draft()
+    draft["forSomeoneElse"] = True
+    draft["mode"] = "new_patient"
+    if language:
+        draft["language"] = language
+    else:
+        for a in reversed(addons or []):
+            if (a.get("type") or "").upper() == "LANGUAGE_PREFERENCE":
+                draft["language"] = a.get("content") or None
+                break
+    draft["step"] = next_missing_step(draft, None)
     return touch_draft(draft)
 
 

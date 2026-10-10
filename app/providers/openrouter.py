@@ -236,7 +236,3 @@ class OpenRouterProvider(BaseLLMProvider):
                 self._in_flight.discard(model_name)
 
         raise last_err or RuntimeError(f"No {provider} model available")
-
-
-# Alias for readability when importing
-GroqProvider = OpenRouterProvider

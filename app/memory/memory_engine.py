@@ -1,7 +1,10 @@
 # Conversation memory: memory engine.
 # Stores or summarizes WhatsApp turns in the dedicated AI Postgres.
+import asyncio
 from typing import Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.logging import logger
+from app.db.session import AsyncSessionLocal
 from app.memory.recent_memory import RecentMemoryManager
 from app.memory.summary_memory import SummaryMemoryManager
 from app.memory.addons import AddonMemoryManager
@@ -38,14 +41,32 @@ class MemoryEngine:
         conversation_id: str,
         live_business_context: Dict[str, Any] = None
     ) -> MemoryContext:
-        # Layer 1: Short recent window — summary + addons cover older context.
-        recent_msgs = await self.recent_mgr.get_recent_messages(db, conversation_id, limit=6)
+        # Three independent reads. Each uses its own session — one AsyncSession
+        # cannot run queries at the same time.
+        async def recent_task():
+            async with AsyncSessionLocal() as session:
+                return await self.recent_mgr.get_recent_messages(session, conversation_id, limit=6)
 
-        # Layer 2: Consolidated Summary
-        summary = await self.summary_mgr.get_summary(db, conversation_id)
+        async def summary_task():
+            async with AsyncSessionLocal() as session:
+                return await self.summary_mgr.get_summary(session, conversation_id)
 
-        # Layer 3: Summary Addons
-        pending_addons = await self.addon_mgr.get_pending_addons(db, conversation_id)
+        async def addon_task():
+            async with AsyncSessionLocal() as session:
+                return await self.addon_mgr.get_pending_addons(session, conversation_id)
+
+        try:
+            recent_msgs, summary, pending_addons = await asyncio.gather(
+                recent_task(),
+                summary_task(),
+                addon_task(),
+            )
+        except Exception as err:
+            # A pool timeout must not drop the reply. Read on the request session.
+            logger.warning(f"Parallel memory read failed, using one session: {err}")
+            recent_msgs = await self.recent_mgr.get_recent_messages(db, conversation_id, limit=6)
+            summary = await self.summary_mgr.get_summary(db, conversation_id)
+            pending_addons = await self.addon_mgr.get_pending_addons(db, conversation_id)
 
         # Layer 4: Live Business Context
         live_context = live_business_context or {}

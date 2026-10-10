@@ -599,6 +599,7 @@ class AIOrchestrator:
             not apt_date
             or want_reschedule
             or force_wizard
+            or verb_book
             or booking_flow.is_status_ask(request.message)
         ):
             cgs_facts = await self._cgs_appointment_facts(apt_id, clinic_id, request_id)
@@ -637,6 +638,7 @@ class AIOrchestrator:
         # Static booking intake (language → service → age → gender → screen)
         # then AI owns date/time/slots/book (NEED_AI_SLOTS)
         booking_ai_handoff = False
+        prefetched_slots = None
         if (
             request.entity_type.upper() in ("CLINIC", "DOCTOR")
             and draft
@@ -671,14 +673,9 @@ class AIOrchestrator:
             and want_reschedule
             and not force_wizard
             and not upcoming_apt
+            and not (draft and draft.get("active"))
         ):
             conversation.awaiting_rebook = True
-            if draft and draft.get("active"):
-                draft = booking_flow.mark_draft_done(draft)
-                await addon_mgr.upsert_addon(
-                    db, conversation.id, booking_flow.BOOKING_DRAFT_TYPE, json.dumps(draft)
-                )
-                draft = None
             used_static_booking = True
             lang = booking_flow._lang({}, memory_ctx.pending_addons)
             last_bit = f" Last visit was {apt_date}." if apt_date else ""
@@ -725,6 +722,7 @@ class AIOrchestrator:
             and getattr(conversation, "awaiting_rebook", False)
             and not force_wizard
             and not want_reschedule
+            and not (draft and draft.get("active"))
         ):
             if booking_flow.is_cancel(request.message, "NEED_AI_SLOTS"):
                 conversation.awaiting_rebook = False
@@ -748,16 +746,11 @@ class AIOrchestrator:
             and not upcoming_apt
             and not verb_book
             and not skip_wizard
+            and not (draft and draft.get("active"))
             and getattr(conversation, "rebook_asked_date", None) != apt_date
         ):
             conversation.awaiting_rebook = True
             conversation.rebook_asked_date = apt_date
-            if draft and draft.get("active"):
-                draft = booking_flow.mark_draft_done(draft)
-                await addon_mgr.upsert_addon(
-                    db, conversation.id, booking_flow.BOOKING_DRAFT_TYPE, json.dumps(draft)
-                )
-                draft = None
             used_static_booking = True
             lang = booking_flow._lang(draft or {}, memory_ctx.pending_addons)
             final_text = (
@@ -785,7 +778,16 @@ class AIOrchestrator:
             step_before = (draft or {}).get("step") if was_active else None
             before_snap = dict(draft) if was_active and draft else {}
 
-            if want_reschedule and upcoming_apt:
+            if booking_flow.booking_for_someone_else(request.message):
+                kept_lang = (draft or {}).get("language") if isinstance(draft, dict) else None
+                draft = booking_flow.seed_someone_else_draft(
+                    memory_ctx.pending_addons, kept_lang
+                )
+                was_active = False
+                step_before = None
+                before_snap = {}
+                logger.info(f"[{request_id}] Booking for someone else — intake from name")
+            elif want_reschedule and upcoming_apt:
                 draft = booking_flow.seed_reschedule_draft(
                     memory_ctx.pending_addons,
                     meta,
@@ -799,7 +801,7 @@ class AIOrchestrator:
                     f"[{request_id}] Reschedule upcoming {apt_date} → "
                     f"date={draft.get('date') or 'ask'}"
                 )
-            elif force_wizard and apt_id:
+            elif (force_wizard or verb_book) and apt_id and not was_active:
                 facts = cgs_facts or await self._cgs_appointment_facts(
                     apt_id, clinic_id, request_id
                 )
@@ -809,8 +811,8 @@ class AIOrchestrator:
                     memory_ctx.pending_addons, meta, facts
                 )
                 logger.info(
-                    f"[{request_id}] Returning book — CGS facts age={facts.get('patientAge')} "
-                    f"→ NEED_SCREEN only"
+                    f"[{request_id}] Returning book — straight to slots "
+                    f"name={facts.get('patientName')} age={facts.get('patientAge')}"
                 )
             elif not was_active:
                 draft = booking_flow.seed_draft_from_context(
@@ -818,12 +820,9 @@ class AIOrchestrator:
                 )
                 logger.info(f"[{request_id}] Static booking started step={draft.get('step')}")
             elif step_before == "NEED_AI_SLOTS":
-                if (draft.get("mode") or "") == "reschedule":
-                    draft = booking_flow.apply_message_to_draft(
-                        draft, request.message, meta
-                    )
-                else:
-                    draft["step"] = "NEED_AI_SLOTS"
+                draft = booking_flow.apply_message_to_draft(
+                    draft, request.message, meta
+                )
                 logger.info(
                     f"[{request_id}] Booking AI-slots turn "
                     f"mode={draft.get('mode')} date={draft.get('date')}"
@@ -872,23 +871,50 @@ class AIOrchestrator:
                     step_before, request.message, before_snap, draft
                 )
             ):
-                booking_resume_suffix = booking_flow.resume_booking_line(step_before, lang)
+                booking_resume_suffix = booking_flow.resume_booking_line(
+                    step_before, lang, draft
+                )
                 run_llm = True
                 logger.info(
                     f"[{request_id}] Booking side-question at {step_before} — LLM then resume"
                 )
             elif step == "NEED_AI_SLOTS":
-                # Hand off to LLM for natural dates + real slot listing + book
-                booking_ai_handoff = True
-                run_llm = True
-                pack = "booking"
-                tool_names = list(self._TOOLS_BOOKING)
-                max_tool_turns = 2
-                tool_schemas = tool_registry.get_openrouter_schemas(
-                    entity_ctx.capabilities,
-                    tool_names=tool_names,
-                )
-                logger.info(f"[{request_id}] Booking → AI slots/book handoff")
+                picked_time = booking_flow.parse_time(request.message)
+                named_date = booking_flow.parse_date(request.message)
+                # A word that is not a day or a time stays on this step.
+                # Saved name, age, and gender stay on the draft.
+                if (
+                    not picked_time
+                    and not named_date
+                    and (draft.get("mode") or "") != "returning"
+                ):
+                    used_static_booking = True
+                    final_text = booking_flow.prompt_for_step("NEED_AI_SLOTS", lang, draft)
+                    logger.info(f"[{request_id}] Booking date re-ask — details kept")
+                else:
+                    booking_ai_handoff = True
+                    run_llm = True
+                    pack = "booking"
+                    if picked_time:
+                        tool_names = list(self._TOOLS_BOOKING)
+                        max_tool_turns = 1
+                        tool_schemas = tool_registry.get_openrouter_schemas(
+                            entity_ctx.capabilities,
+                            tool_names=tool_names,
+                        )
+                    else:
+                        if named_date:
+                            prefetched_slots = await booking_flow.check_slots_on_date(
+                                tool_context, named_date
+                            )
+                        else:
+                            prefetched_slots = await booking_flow.prefetch_open_slots(
+                                tool_context
+                            )
+                        tool_names = []
+                        max_tool_turns = 1
+                        tool_schemas = None
+                    logger.info(f"[{request_id}] Booking → AI slots/book handoff")
             elif step == "DONE":
                 used_static_booking = True
                 final_text = (
@@ -898,51 +924,7 @@ class AIOrchestrator:
                 )
             else:
                 used_static_booking = True
-                if (
-                    step == "NEED_LANGUAGE"
-                    and booking_flow.parse_language(request.message) is None
-                    and draft.get("language") is None
-                    and not booking_flow.is_book_intent(request.message)
-                ):
-                    final_text = (
-                        "Hinglish theek rahegi ya English? Jo comfortable ho woh likh dena.\n"
-                        "Hinglish or English — whichever is easier."
-                    )
-                elif (
-                    step == "NEED_NAME"
-                    and not booking_flow.is_usable_patient_name(draft.get("patientName"))
-                    and booking_flow.parse_patient_name(request.message) is None
-                    and not booking_flow.is_book_intent(request.message)
-                ):
-                    final_text = (
-                        "Poora naam chahiye — 3 letters se lamba, jaise Ananya."
-                        if lang == "hinglish"
-                        else "Please send the full name. It needs to be more than 3 letters, like Ananya."
-                    )
-                elif (
-                    step == "NEED_AGE"
-                    and booking_flow.parse_age(request.message) is None
-                    and draft.get("age") is None
-                    and not booking_flow.is_book_intent(request.message)
-                ):
-                    final_text = (
-                        "Age sirf number mein bhej dena, jaise 23 — phir aage badhte hain."
-                        if lang == "hinglish"
-                        else "Just send the age as a number, like 23, and I'll keep going."
-                    )
-                elif (
-                    step == "NEED_GENDER"
-                    and booking_flow.parse_gender(request.message) is None
-                    and draft.get("gender") is None
-                    and not booking_flow.is_book_intent(request.message)
-                ):
-                    final_text = (
-                        "Gender Male, Female ya Other mein likh dena — jo bhi apply hota hai."
-                        if lang == "hinglish"
-                        else "You can reply Male, Female, or Other — whichever applies."
-                    )
-                else:
-                    final_text = booking_flow.prompt_for_step(step, lang, draft)
+                final_text = booking_flow.prompt_for_step(step, lang, draft)
 
         # Hard early-exit: greet / post-booking outro / mid-chat ack — no OpenRouter
         elif max_tool_turns == 0 and pack in ("greet", "outro", "ack", "close"):
@@ -992,26 +974,34 @@ class AIOrchestrator:
                 handoff = booking_flow.ai_slot_handoff_system(
                     draft, booking_flow._lang(draft, memory_ctx.pending_addons)
                 )
-                if (draft.get("mode") or "") == "returning":
+                open_list = []
+                slot_date = None
+                if isinstance(prefetched_slots, dict):
+                    open_list = prefetched_slots.get("availableSlots") or []
+                    slot_date = prefetched_slots.get("date")
+                elif (draft.get("mode") or "") == "returning":
                     slots = await booking_flow.prefetch_open_slots(tool_context)
                     open_list = slots.get("availableSlots") or []
-                    if open_list:
-                        draft["date"] = slots.get("date")
-                        await addon_mgr.upsert_addon(
-                            db,
-                            conversation.id,
-                            booking_flow.BOOKING_DRAFT_TYPE,
-                            json.dumps(draft),
-                        )
-                        shown = ", ".join(str(s) for s in open_list[:12])
-                        handoff += (
-                            f"\nCGS already returned open slots for {slots.get('date')}: {shown}. "
-                            "Do NOT ask for a date. List these slots and wait for a time."
-                        )
-                        logger.info(
-                            f"[{request_id}] Returning book — prefetched "
-                            f"{len(open_list)} slots on {slots.get('date')}"
-                        )
+                    slot_date = slots.get("date")
+                if slot_date and open_list:
+                    draft["date"] = slot_date
+                    await addon_mgr.upsert_addon(
+                        db,
+                        conversation.id,
+                        booking_flow.BOOKING_DRAFT_TYPE,
+                        json.dumps(draft),
+                    )
+                if slot_date:
+                    shown = ", ".join(str(s) for s in open_list[:6]) or "none"
+                    handoff += (
+                        f"\nCGS already returned open slots for {slot_date}: {shown}. "
+                        "These times already skip anything that has passed today. "
+                        "Write ONE short sentence listing only these times and ask which one they want. "
+                        "Do NOT call check_availability. Do NOT invent times."
+                    )
+                    logger.info(
+                        f"[{request_id}] Slots prefetched: {len(open_list)} on {slot_date}"
+                    )
                 messages.append({
                     "role": "system",
                     "content": handoff,
@@ -1062,14 +1052,21 @@ class AIOrchestrator:
                     )
                 except Exception as llm_err:
                     logger.error(f"[{request_id}] All LLM models failed: {llm_err}")
-                    card = clinic_card_reply(
-                        request.message,
-                        entity_ctx.live_business_context or {},
-                        entity_ctx.name or "our clinic",
-                    )
-                    final_text = card or self._REPLY_GENERIC_EMPTY
-                    if booking_resume_suffix and card:
-                        final_text = f"{final_text}\n\n{booking_resume_suffix}"
+                    if isinstance(prefetched_slots, dict) and prefetched_slots.get("date"):
+                        final_text = booking_flow.format_open_slots(
+                            str(prefetched_slots.get("date")),
+                            list(prefetched_slots.get("availableSlots") or []),
+                            booking_flow._lang(draft or {}, memory_ctx.pending_addons),
+                        )
+                    else:
+                        card = clinic_card_reply(
+                            request.message,
+                            entity_ctx.live_business_context or {},
+                            entity_ctx.name or "our clinic",
+                        )
+                        final_text = card or self._REPLY_GENERIC_EMPTY
+                        if booking_resume_suffix and card:
+                            final_text = f"{final_text}\n\n{booking_resume_suffix}"
                     break
 
                 total_prompt_tokens += llm_res.prompt_tokens
@@ -1266,6 +1263,15 @@ class AIOrchestrator:
                         lang=lang_for_guard,
                         rescheduled=booking_facts["rescheduled"],
                     )
+
+        if not (final_text or "").strip() and isinstance(prefetched_slots, dict):
+            slot_date = prefetched_slots.get("date")
+            if slot_date:
+                final_text = booking_flow.format_open_slots(
+                    str(slot_date),
+                    list(prefetched_slots.get("availableSlots") or []),
+                    lang_for_guard,
+                )
 
         if not (final_text or "").strip():
             # Last resort: answer from tool results instead of a generic line that also

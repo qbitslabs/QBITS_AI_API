@@ -15,6 +15,10 @@ engine = create_async_engine(
     echo=getattr(settings, "DEBUG", False),
     future=True,
     pool_pre_ping=True,
+    pool_size=8,
+    max_overflow=8,
+    pool_timeout=15,
+    pool_recycle=1800,
     connect_args={
         "ssl": "require",
         "server_settings": {"search_path": "public"},
